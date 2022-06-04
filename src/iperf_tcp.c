@@ -359,6 +359,56 @@ iperf_tcp_listen(struct iperf_test *test)
 }
 
 
+static int
+socks5_handshake(struct iperf_test *test, int s) {
+    char res[2 + 4 + 1 + 256 + 2];
+    char req[3 + 4 + 256 + 2] = {
+        5, 1, 0,
+        5, 1, 0, 3,
+    };
+    size_t alen = strlen(test->server_hostname);
+    if (alen > 255) {
+        printf("server hostname too long: %zu\n", alen);
+        return -1;
+    }
+    req[3 + 4] = (char)alen;
+    memcpy(&req[3 + 4 + 1], test->server_hostname, alen);
+    req[3 + 4 + 1 + alen + 0] = (char)(test->server_port >> 8);
+    req[3 + 4 + 1 + alen + 1] = (char)(test->server_port >> 0);
+
+    if (Nwrite(s, req, 3 + 4 + 1 + alen + 2, Ptcp) < 0) {
+        return -1;
+    }
+    if (Nread(s, res, 2 + 4, Ptcp) != 2 + 4) {
+        return -1;
+    }
+    if (0 != memcmp(res, "\x05\0" "\x05\0\0", 5)) {
+        return -1;
+    }
+    switch (res[5]) {
+    case 1:
+        alen = 4;
+        break;
+    case 3:
+        if (1 != read(s, &res[6], 1)) {
+            return -1;
+        }
+        alen = (unsigned char)res[6];
+        break;
+    case 4:
+        alen = 16;
+        break;
+    default:
+        return -1;
+    }
+    if (Nread(s, res, alen + 2, Ptcp) != alen + 2) {
+        return -1;
+    }
+
+    return 0;
+}
+
+
 /* iperf_tcp_connect
  *
  * connect to a TCP stream listener
@@ -374,8 +424,17 @@ iperf_tcp_connect(struct iperf_test *test)
     socklen_t optlen;
     int saved_errno;
     int rcvbuf_actual, sndbuf_actual;
+    const char *connect_server;
+    int connect_port;
 
-    s = create_socket(test->settings->domain, SOCK_STREAM, test->bind_address, test->bind_dev, test->bind_port, test->server_hostname, test->server_port, &server_res);
+    connect_server = test->server_hostname;
+    connect_port = test->server_port;
+    if (test->socks5_proxy) {
+        connect_server = test->socks5_proxy;
+        connect_port = 1080;    // FIXME: parse port from test->socks5_proxy
+    }
+
+    s = create_socket(test->settings->domain, SOCK_STREAM, test->bind_address, test->bind_dev, test->bind_port, connect_server, connect_port, &server_res);
     if (s < 0) {
 	i_errno = IESTREAMCONNECT;
 	return -1;
@@ -555,6 +614,17 @@ iperf_tcp_connect(struct iperf_test *test)
     }
 
     freeaddrinfo(server_res);
+
+    /* socks5 handshake */
+    /* https://datatracker.ietf.org/doc/html/rfc1928 */
+    errno = 0;
+    if (test->socks5_proxy && 0 != socks5_handshake(test, s)) {
+        saved_errno = errno;
+        close(s);
+        errno = saved_errno;
+        i_errno = IESTREAMCONNECT;  // FIXME: new error msg
+        return -1;
+    }
 
     /* Send cookie for verification */
     if (Nwrite(s, test->cookie, COOKIE_SIZE, Ptcp) < 0) {

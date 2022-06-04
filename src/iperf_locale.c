@@ -148,6 +148,7 @@ const char usage_longstr[] = "Usage: iperf3 [-s|-c host] [options]\n"
                            "Client specific:\n"
                            "  -c, --client <host>[%%<dev>] run in client mode, connecting to <host>\n"
                            "                              (option <dev> equivalent to `--bind-dev <dev>`)\n"
+                           "  --socks5-proxy            connect through socks5 proxy\n"
 #if defined(HAVE_SCTP_H)
                            "  --sctp                    use SCTP rather than TCP\n"
                            "  -X, --xbind <name>        bind SCTP association to links\n"
