@@ -397,6 +397,8 @@ struct iperf_test
     /* Server output (use on server side only) */
     TAILQ_HEAD(iperf_textlisthead, iperf_textline) server_output_list;
 
+    // for socks5 proxy
+    struct sockaddr_storage udp_server_addr;
 };
 
 /* default settings */

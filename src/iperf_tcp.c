@@ -359,8 +359,8 @@ iperf_tcp_listen(struct iperf_test *test)
 }
 
 
-static int
-socks5_handshake(struct iperf_test *test, int s) {
+/* https://datatracker.ietf.org/doc/html/rfc1928 */
+int socks5_handshake(struct iperf_test *test, int s) {
     char res[2 + 4 + 1 + 256 + 2];
     char req[3 + 4 + 256 + 2] = {
         5, 1, 0,
@@ -393,7 +393,7 @@ socks5_handshake(struct iperf_test *test, int s) {
         if (1 != read(s, &res[6], 1)) {
             return -1;
         }
-        alen = (unsigned char)res[6];
+        alen = (uint8_t)res[6];
         break;
     case 4:
         alen = 16;
@@ -424,11 +424,9 @@ iperf_tcp_connect(struct iperf_test *test)
     socklen_t optlen;
     int saved_errno;
     int rcvbuf_actual, sndbuf_actual;
-    const char *connect_server;
-    int connect_port;
 
-    connect_server = test->server_hostname;
-    connect_port = test->server_port;
+    const char * connect_server = test->server_hostname;
+    int connect_port = test->server_port;
     if (test->socks5_proxy) {
         connect_server = test->socks5_proxy;
         connect_port = 1080;    // FIXME: parse port from test->socks5_proxy
@@ -616,7 +614,6 @@ iperf_tcp_connect(struct iperf_test *test)
     freeaddrinfo(server_res);
 
     /* socks5 handshake */
-    /* https://datatracker.ietf.org/doc/html/rfc1928 */
     errno = 0;
     if (test->socks5_proxy && 0 != socks5_handshake(test, s)) {
         saved_errno = errno;

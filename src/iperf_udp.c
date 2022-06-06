@@ -33,6 +33,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #ifdef HAVE_STDINT_H
 #include <stdint.h>
@@ -61,6 +62,41 @@
 # endif
 #endif
 
+
+// +----+------+------+----------+----------+----------+
+// |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+// +----+------+------+----------+----------+----------+
+// | 2  |  1   |  1   | Variable |    2     | Variable |
+// +----+------+------+----------+----------+----------+
+static int
+socks5_header_len(const uint8_t *pkt, size_t n) {
+    if (n <= 6) {
+        return -1;
+    }
+    if (pkt[0] != 0 || pkt[1] != 0 || pkt[2] != 0) {
+        return -1;
+    }
+    size_t alen = 0;
+    switch (pkt[3]) {
+    case 1:
+        alen = 4;
+        break;
+    case 4:
+        alen = 16;
+        break;
+    case 3:
+        alen = 1 + (size_t)pkt[4];
+        break;
+    default:
+        return -1;
+    }
+    if (n < 4 + alen + 2) {
+        return -1;
+    }
+    return 4 + alen + 2;
+}
+
+
 /* iperf_udp_recv
  *
  * receives the data for UDP
@@ -76,7 +112,7 @@ iperf_udp_recv(struct iperf_stream *sp)
     double    transit = 0, d = 0;
     struct iperf_time sent_time, arrival_time, temp_time;
 
-    r = Nread(sp->socket, sp->buffer, size, Pudp);
+    r = read(sp->socket, sp->buffer, size);
 
     /*
      * If we got an error in the read, or if we didn't read anything
@@ -100,11 +136,21 @@ iperf_udp_recv(struct iperf_stream *sp)
 	sp->result->bytes_received += r;
 	sp->result->bytes_received_this_interval += r;
 
-	/* Dig the various counters out of the incoming UDP packet */
+    const char *data = sp->buffer;
+    if (sp->test->socks5_proxy) {
+        int n = socks5_header_len((const uint8_t *)sp->buffer, (size_t)r);
+        if (n < 0) {
+            return -1;
+        }
+        data += n;
+    }
+
+    // FIXME: need check the size of packet
+    /* Dig the various counters out of the incoming UDP packet */
+    memcpy(&sec, data, sizeof(sec));
+    memcpy(&usec, data+4, sizeof(usec));
 	if (sp->test->udp_counters_64bit) {
-	    memcpy(&sec, sp->buffer, sizeof(sec));
-	    memcpy(&usec, sp->buffer+4, sizeof(usec));
-	    memcpy(&pcount, sp->buffer+8, sizeof(pcount));
+	    memcpy(&pcount, data+8, sizeof(pcount));
 	    sec = ntohl(sec);
 	    usec = ntohl(usec);
 	    pcount = be64toh(pcount);
@@ -113,9 +159,7 @@ iperf_udp_recv(struct iperf_stream *sp)
 	}
 	else {
 	    uint32_t pc;
-	    memcpy(&sec, sp->buffer, sizeof(sec));
-	    memcpy(&usec, sp->buffer+4, sizeof(usec));
-	    memcpy(&pc, sp->buffer+8, sizeof(pc));
+	    memcpy(&pc, data+8, sizeof(pc));
 	    sec = ntohl(sec);
 	    usec = ntohl(usec);
 	    pcount = ntohl(pc);
@@ -220,35 +264,53 @@ iperf_udp_send(struct iperf_stream *sp)
 
     ++sp->packet_count;
 
+    size_t tssz = 4 + 4 + (sp->test->udp_counters_64bit ? 8 : 4);
+
+    // +----+------+------+----------+----------+----------+
+    // |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+    // +----+------+------+----------+----------+----------+
+    // | 2  |  1   |  1   | Variable |    2     | Variable |
+    // +----+------+------+----------+----------+----------+
+    size_t hdrsz = 0;
+    if (sp->test->socks5_proxy) {
+        size_t alen = 0;
+        const void *addr = NULL;
+        if (sp->test->udp_server_addr.ss_family == AF_INET) {
+            struct sockaddr_in *sa = (struct sockaddr_in *)&sp->test->udp_server_addr;
+            alen = 4;
+            addr = &sa->sin_addr.s_addr;
+        } else {
+            struct sockaddr_in6 *sa = (struct sockaddr_in6 *)&sp->test->udp_server_addr;
+            alen = 16;
+            addr = &sa->sin6_addr;
+        }
+        hdrsz = 4 + alen + 2;
+        if (hdrsz + tssz > sp->settings->blksize) {
+            // buffer too small
+            return -1;
+        }
+
+        sp->buffer[0] = sp->buffer[1] = sp->buffer[2] = 0;
+        sp->buffer[3] = (alen == 4) ? 1 : 4;
+        memcpy(sp->buffer + 4, addr, alen);
+        sp->buffer[4 + alen + 0] = (char)(uint8_t)(sp->test->server_port >> 8);
+        sp->buffer[4 + alen + 1] = (char)(uint8_t)(sp->test->server_port >> 0);
+    }
+
+    char *data = sp->buffer + hdrsz;
+    uint32_t sec = htonl(before.secs);
+    uint32_t usec = htonl(before.usecs);
+    memcpy(data + 0, &sec, sizeof(sec));
+    memcpy(data + 4, &usec, sizeof(usec));
     if (sp->test->udp_counters_64bit) {
-
-	uint32_t  sec, usec;
-	uint64_t  pcount;
-
-	sec = htonl(before.secs);
-	usec = htonl(before.usecs);
-	pcount = htobe64(sp->packet_count);
-
-	memcpy(sp->buffer, &sec, sizeof(sec));
-	memcpy(sp->buffer+4, &usec, sizeof(usec));
-	memcpy(sp->buffer+8, &pcount, sizeof(pcount));
-
-    }
-    else {
-
-	uint32_t  sec, usec, pcount;
-
-	sec = htonl(before.secs);
-	usec = htonl(before.usecs);
-	pcount = htonl(sp->packet_count);
-
-	memcpy(sp->buffer, &sec, sizeof(sec));
-	memcpy(sp->buffer+4, &usec, sizeof(usec));
-	memcpy(sp->buffer+8, &pcount, sizeof(pcount));
-
+        uint64_t pcount = htobe64(sp->packet_count);
+        memcpy(data + 8, &pcount, sizeof(pcount));
+    } else {
+        uint32_t pcount = htonl(sp->packet_count);
+        memcpy(data + 8, &pcount, sizeof(pcount));
     }
 
-    r = Nwrite(sp->socket, sp->buffer, size, Pudp);
+    r = write(sp->socket, sp->buffer, size);
 
     if (r < 0)
 	return r;
@@ -486,6 +548,48 @@ iperf_udp_listen(struct iperf_test *test)
 }
 
 
+static int
+socks5_udp_handshake(int s, int *port_out) {
+    char res[2 + 4 + 1 + 256 + 2];
+    char req[3 + 4 + 256 + 2] = {
+        5, 1, 0,
+        5, 3, 0, 1,
+    };
+    size_t alen = 4;
+    if (Nwrite(s, req, 3 + 4 + alen + 2, Ptcp) < 0) {
+        return -1;
+    }
+    if (Nread(s, res, 2 + 4, Ptcp) != 2 + 4) {
+        return -1;
+    }
+    if (0 != memcmp(res, "\x05\0" "\x05\0\0", 5)) {
+        return -1;
+    }
+    switch (res[5]) {
+    case 1:
+        alen = 4;
+        break;
+    case 3:
+        if (1 != read(s, &res[6], 1)) {
+            return -1;
+        }
+        alen = (uint8_t)res[6];
+        break;
+    case 4:
+        alen = 16;
+        break;
+    default:
+        return -1;
+    }
+    if (Nread(s, res, alen + 2, Ptcp) != alen + 2) {
+        return -1;
+    }
+    *port_out = (int)((((uint8_t)res[alen + 0]) << 8) | (uint8_t)res[alen + 1]);
+
+    return 0;
+}
+
+
 /*
  * iperf_udp_connect
  *
@@ -495,15 +599,50 @@ int
 iperf_udp_connect(struct iperf_test *test)
 {
     int s, sz;
-    unsigned int buf;
 #ifdef SO_RCVTIMEO
     struct timeval tv;
 #endif
     int rc;
-    int i, max_len_wait_for_reply;
+    int i, max_cnt_wait_for_reply;
+    int connect_port = test->server_port;
+
+    const char *connect_server = test->server_hostname;
+    if (test->socks5_proxy) {
+        connect_server = test->socks5_proxy;
+        connect_port = 1080;    // FIXME: parse port from test->socks5_proxy
+
+        int proxy_so = netdial(
+            test->settings->domain, Ptcp, test->bind_address, test->bind_dev, 0,
+            connect_server, connect_port, test->settings->connect_timeout
+        );
+        if (proxy_so < 0) {
+            i_errno = IESTREAMCONNECT;
+            return -1;
+        }
+
+        if (0 != socks5_udp_handshake(proxy_so, &connect_port)) {
+            i_errno = IESTREAMCONNECT;
+            return -1;
+        }
+
+        // resolve server locally
+        struct addrinfo *server_res = NULL;
+        char portstr[16] = {};
+        snprintf(portstr, sizeof(portstr), "%d", test->server_port);
+        (void)getaddrinfo(test->server_hostname, portstr, NULL, &server_res);
+        if (!server_res) {
+            i_errno = IESTREAMCONNECT;
+            return -1;
+        }
+        freeaddrinfo(server_res);
+        memcpy(&test->udp_server_addr, server_res->ai_addr, server_res->ai_addrlen);
+
+        // FIXME: proxy_so leak
+        ;
+    }
 
     /* Create and bind our local socket. */
-    if ((s = netdial(test->settings->domain, Pudp, test->bind_address, test->bind_dev, test->bind_port, test->server_hostname, test->server_port, -1)) < 0) {
+    if ((s = netdial(test->settings->domain, Pudp, test->bind_address, test->bind_dev, test->bind_port, connect_server, connect_port, -1)) < 0) {
         i_errno = IESTREAMCONNECT;
         return -1;
     }
@@ -566,11 +705,37 @@ iperf_udp_connect(struct iperf_test *test)
      * Write a datagram to the UDP stream to let the server know we're here.
      * The server learns our address by obtaining its peer's address.
      */
-    buf = UDP_CONNECT_MSG;
+    // +----+------+------+----------+----------+----------+
+    // |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+    // +----+------+------+----------+----------+----------+
+    // | 2  |  1   |  1   | Variable |    2     | Variable |
+    // +----+------+------+----------+----------+----------+
+    uint8_t buf[4 + 16 + 2 + 4] = {};
+    size_t reqsz = 0;
+    if (test->socks5_proxy) {
+        size_t alen = 0;
+        if (test->udp_server_addr.ss_family == AF_INET) {
+            buf[3] = 1;
+            struct sockaddr_in *addr = (struct sockaddr_in *)&test->udp_server_addr;
+            memcpy(buf + 4, &addr->sin_addr.s_addr, 4);
+            alen = 4;
+        } else {
+            buf[3] = 4;
+            struct sockaddr_in6 *addr = (struct sockaddr_in6 *)&test->udp_server_addr;
+            memcpy(buf + 4, &addr->sin6_addr, 16);
+            alen = 16;
+        }
+        buf[4 + alen + 0] = (uint8_t)(test->server_port >> 8);
+        buf[4 + alen + 1] = (uint8_t)test->server_port;
+        reqsz = 4 + alen + 2;
+    }
+    uint32_t code = UDP_CONNECT_MSG;
+    memcpy(buf + reqsz, &code, 4);
+    reqsz += 4;
     if (test->debug) {
         printf("Sending Connect message to Sockt %d\n", s);
     }
-    if (write(s, &buf, sizeof(buf)) < 0) {
+    if (write(s, buf, reqsz) < 0) {
         // XXX: Should this be changed to IESTREAMCONNECT?
         i_errno = IESTREAMWRITE;
         return -1;
@@ -580,21 +745,29 @@ iperf_udp_connect(struct iperf_test *test)
      * Wait until the server replies back to us with the "accept" response.
      */
     i = 0;
-    max_len_wait_for_reply = sizeof(buf);
+    max_cnt_wait_for_reply = 1;
     if (test->reverse) /* In reverse mode allow few packets to have the "accept" response - to handle out of order packets */
-        max_len_wait_for_reply += MAX_REVERSE_OUT_OF_ORDER_PACKETS * test->settings->blksize;
+        max_cnt_wait_for_reply += MAX_REVERSE_OUT_OF_ORDER_PACKETS;
     do {
-        if ((sz = recv(s, &buf, sizeof(buf), 0)) < 0) {
+        memset(buf, 0, sizeof(buf));
+        if ((sz = recv(s, buf, sizeof(buf), 0)) < 0) {
             i_errno = IESTREAMREAD;
             return -1;
         }
-        if (test->debug) {
-            printf("Connect received for Socket %d, sz=%d, buf=%x, i=%d, max_len_wait_for_reply=%d\n", s, sz, buf, i, max_len_wait_for_reply);
-        }
-        i += sz;
-    } while (buf != UDP_CONNECT_REPLY && buf != LEGACY_UDP_CONNECT_REPLY && i < max_len_wait_for_reply);
+        i += 1;
 
-    if (buf != UDP_CONNECT_REPLY  && buf != LEGACY_UDP_CONNECT_REPLY) {
+        int hdrlen = test->socks5_proxy ? socks5_header_len(buf, (size_t)sz) : 0;
+        if (hdrlen < 0 || hdrlen + 4 < (size_t)sz) {
+            continue;
+        }
+        memcpy(&code, buf + hdrlen, 4);
+
+        if (test->debug) {
+            printf("Connect received for Socket %d, sz=%d, buf=%x, i=%d, max_cnt_wait_for_reply=%d\n", s, sz, code, i, max_cnt_wait_for_reply);
+        }
+    } while (code != UDP_CONNECT_REPLY && code != LEGACY_UDP_CONNECT_REPLY && i < max_cnt_wait_for_reply);
+
+    if (code != UDP_CONNECT_REPLY && code != LEGACY_UDP_CONNECT_REPLY) {
         i_errno = IESTREAMREAD;
         return -1;
     }

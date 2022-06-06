@@ -375,12 +375,26 @@ iperf_connect(struct iperf_test *test)
 
     make_cookie(test->cookie);
 
+    const char * connect_server = test->server_hostname;
+    int connect_port = test->server_port;
+    if (test->socks5_proxy) {
+        connect_server = test->socks5_proxy;
+        connect_port = 1080;    // FIXME: parse port from test->socks5_proxy
+    }
+
     /* Create and connect the control channel */
     if (test->ctrl_sck < 0)
 	// Create the control channel using an ephemeral port
-	test->ctrl_sck = netdial(test->settings->domain, Ptcp, test->bind_address, test->bind_dev, 0, test->server_hostname, test->server_port, test->settings->connect_timeout);
+	test->ctrl_sck = netdial(test->settings->domain, Ptcp, test->bind_address, test->bind_dev, 0, connect_server, connect_port, test->settings->connect_timeout);
     if (test->ctrl_sck < 0) {
         i_errno = IECONNECT;
+        return -1;
+    }
+
+    /* socks5 handshake */
+    int socks5_handshake(struct iperf_test *test, int s);
+    if (test->socks5_proxy && 0 != socks5_handshake(test, test->ctrl_sck)) {
+        i_errno = IECONNECT;  // FIXME: new error msg
         return -1;
     }
 
